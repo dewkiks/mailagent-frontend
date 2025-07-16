@@ -17,8 +17,8 @@ import os
 
 # --- Configuration ---
 
-API_BASE_URL = "https://mail-support-demo-production.up.railway.app"
-WEBSOCKET_URL = "wss://mail-support-demo-production.up.railway.app/ws"
+API_BASE_URL = "http://18.61.69.3:5000"
+WEBSOCKET_URL = "ws://18.61.69.3:5000/ws"
 
 
 # Configure Streamlit
