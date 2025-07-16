@@ -1,0 +1,8 @@
+streamlit
+requests
+pandas
+plotly
+websocket-client
+websockets
+fastapi
+uvicorn[standard]
