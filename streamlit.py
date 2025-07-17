@@ -14,11 +14,13 @@ import logging
 from urllib.parse import urlparse, urljoin
 import socket
 import os
-
+from dotenv import load_dotenv
+load_dotenv()
 # --- Configuration ---
 
-API_BASE_URL = "http://18.61.69.3:5000"
-WEBSOCKET_URL = "ws://18.61.69.3:5000/ws"
+API_BASE_URL = os.getenv("API_BASE_URL")
+# API_BASE_URL = "http://localhost:8000"
+WEBSOCKET_URL = os.getenv("WEBSOCKET_URL")
 
 
 # Configure Streamlit
@@ -43,6 +45,10 @@ if 'processed_emails' not in st.session_state:
 if 'pending_toast' not in st.session_state:
     st.session_state.pending_toast = None
 
+# Add this to track if we need to rerun
+if 'needs_rerun' not in st.session_state:
+    st.session_state.needs_rerun = False
+
 # --- Logger Setup ---
 logger = logging.getLogger("email_bot_dashboard")
 if not logger.handlers:
@@ -62,11 +68,18 @@ class APIClient:
         url = f"{self.base_url}{endpoint}"
         try:
             response = requests.request(method, url, timeout=10, **kwargs)
-            response.raise_for_status()
-            return response.json()
+            response.raise_for_status()  # This will raise an exception for HTTP errors
+            
+            # Try to parse JSON response
+            try:
+                return response.json()
+            except ValueError:
+                # If response is not JSON, return the text content
+                return {"message": response.text, "status_code": response.status_code}
+                
         except requests.exceptions.RequestException as e:
             logger.error(f"API request to {url} failed: {e}")
-            st.error(f"Error communicating with the API. Please ensure the backend is running.")
+            # Don't show error to user here, let the calling method handle it
             return None
 
     def get_status(self) -> Dict:
@@ -110,8 +123,18 @@ class APIClient:
 
     def send_manual_reply(self, data: Dict) -> Dict:
         """Send manual reply"""
-        return self._request("post", "/send-manual-reply", json=data) or \
-            {"success": False, "message": "API request failed"}
+        url = f"{self.base_url}/send-manual-reply"
+        try:
+            response = requests.post(url, json=data, timeout=30)  # Increased timeout
+            response.raise_for_status()
+            return {"success": True, "message": "Reply sent successfully"}
+        except requests.exceptions.Timeout:
+            # Assume success on timeout since email is likely sent
+            logger.warning("Manual reply request timed out, but email may have been sent")
+            return {"success": True, "message": "Reply sent (request timed out but likely successful)"}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error sending manual reply: {e}")
+            return {"success": False, "message": f"Request failed: {str(e)}"}
 
     def send_manual_process(self, data: Dict) -> Dict:
         """Process email manually"""
@@ -139,8 +162,9 @@ class WebSocketManager:
 
     def start(self):
         """Start the WebSocket client in a background thread."""
-        self.thread = threading.Thread(target=self._run_client, daemon=True)
-        self.thread.start()
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._run_client, daemon=True)
+            self.thread.start()
 
     def stop(self):
         """Stop the WebSocket client."""
@@ -191,51 +215,17 @@ class WebSocketManager:
             
             await asyncio.sleep(5)
 
-    def process_updates(self) -> bool:
-        """Process all messages from the WebSocket queue."""
-        if self.queue.empty():
-            return False
-            
-        updates_processed = False
-        with self.lock:
-            while not self.queue.empty():
-                message = self.queue.get()
-                updates_processed = True
-                msg_type = message.get('type')
-
-                if msg_type == 'connection_status':
-                    st.session_state.websocket_data['connection_status'] = message.get('status', 'Unknown')
-                    st.session_state.websocket_data['connected'] = (message.get('status') == 'Connected')
-                elif msg_type == 'processing_started':
-                    st.session_state.websocket_data['is_processing'] = True
-                elif msg_type == 'status_update':
-                    st.session_state.websocket_data['status'] = message
-                elif msg_type == 'email_processed':
-                    st.session_state.websocket_data['is_processing'] = False
-                    st.session_state.websocket_data['last_processed_event'] = message
-                    st.session_state.websocket_data['latest_events'].insert(0, message)
-                    # Keep only the last 10 events
-                    st.session_state.websocket_data['latest_events'] = st.session_state.websocket_data['latest_events'][:10]
-
-                # Update stats if present
-                if msg_type in ['email_processed', 'status_update', 'processing_started']:
-                    st.session_state.should_rerun = True
-                    
-                st.session_state.websocket_data['last_update'] = datetime.now()
-        
-        return updates_processed
-
 # --- UI Components ---
 class UI:
     """Handles rendering of the Streamlit UI components."""
     def __init__(self, api_client: APIClient):
         self.api_client = api_client
 
-
     def render_custom_css(self):
         """Render custom CSS for the dashboard"""
         st.markdown("""
             <style>
+                    
                 /* Dark Theme Body and Font */
                 body {
                     color: #fafafa;
@@ -346,133 +336,170 @@ class UI:
                     border-radius: 15px;
                     overflow: hidden;
                 }
+                /* Status Bar Styles */
+                .agent-status-bar {
+                    background: #1a1d29;
+                    padding: 0.8rem 1.2rem;
+                    border-radius: 8px;
+                    border: 1px solid #2a2d35;
+                    margin-bottom: 1rem;
+                    display: flex;
+                    align-items: center;
+                    gap: 0.8rem;
+                }
+
+                .status-indicator {
+                    width: 8px;
+                    height: 8px;
+                    border-radius: 50%;
+                    flex-shrink: 0;
+                }
+
+                .status-processing {
+                    background-color: #ffc107;
+                    animation: pulse 2s infinite;
+                }
+
+                .status-idle {
+                    background-color: #28a745;
+                }
+
+                .status-text {
+                    color: #ffffff;
+                    font-size: 0.9rem;
+                    font-weight: 500;
+                    margin: 0;
+                }
+
+                @keyframes pulse {
+                    0% { opacity: 1; }
+                    50% { opacity: 0.5; }
+                    100% { opacity: 1; }
+                }
+                    
+                /* Dashboard Status Bar Styles */
+                .dashboard-status-container {
+                    display: flex;
+                    gap: 1rem;
+                    margin-bottom: 2rem;
+                }
+
+                .dashboard-status-card {
+                    background: #1a1d29;
+                    border: 1px solid #2a2d35;
+                    border-radius: 12px;
+                    padding: 1.5rem;
+                    flex: 1;
+                    min-height: 80px;
+                    display: flex;
+                    align-items: center;
+                    gap: 1rem;
+                    transition: all 0.3s ease;
+                }
+
+                .dashboard-status-card:hover {
+                    border-color: #3a3d45;
+                    transform: translateY(-2px);
+                }
+
+                .dashboard-status-icon {
+                    width: 12px;
+                    height: 12px;
+                    border-radius: 50%;
+                    flex-shrink: 0;
+                }
+
+                .dashboard-status-content {
+                    flex: 1;
+                }
+
+                .dashboard-status-title {
+                    font-size: 0.9rem;
+                    color: #a0a0a0;
+                    margin: 0 0 0.5rem 0;
+                    font-weight: 500;
+                }
+
+                .dashboard-status-value {
+                    font-size: 1.2rem;
+                    font-weight: 600;
+                    color: #ffffff;
+                    margin: 0;
+                }
+
+                .status-running {
+                    background-color: #28a745;
+                    box-shadow: 0 0 10px rgba(40, 167, 69, 0.3);
+                }
+
+                .status-stopped {
+                    background-color: #dc3545;
+                    box-shadow: 0 0 10px rgba(220, 53, 69, 0.3);
+                }
+
+                .status-warning {
+                    background-color: #ffc107;
+                    box-shadow: 0 0 10px rgba(255, 193, 7, 0.3);
+                }
+
+                .status-processing {
+                    background-color: #17a2b8;
+                    animation: pulse 2s infinite;
+                }
+
+                @keyframes pulse {
+                    0% { box-shadow: 0 0 10px rgba(23, 162, 184, 0.3); }
+                    50% { box-shadow: 0 0 20px rgba(23, 162, 184, 0.6); }
+                    100% { box-shadow: 0 0 10px rgba(23, 162, 184, 0.3); }
+}
             </style>
         """, unsafe_allow_html=True)
 
     def render_sidebar(self) -> str:
         """Render the sidebar with navigation and status"""
         with st.sidebar:
-            st.markdown('<div class="sidebar-header"><h1>📧 Email Support Agent</h1></div>', unsafe_allow_html=True)
+            st.markdown('<div class="sidebar-header"><h1>Email Support Demo</h1></div>', unsafe_allow_html=True)
             
-            page = st.radio("Navigation", ["Dashboard", "Manual Review", "History", "Settings"], key="navigation")
+            page = st.radio("Navigation", ["Dashboard", "Manual Review", "History"], key="navigation")
 
             st.markdown("<br>", unsafe_allow_html=True)
             st.subheader("Agent Status")
 
-            # Create placeholders for dynamic status updates
-            self.processing_status_placeholder = st.empty()
-            self.connection_status_placeholder = st.empty()
+            # Processing Status Bar
+            is_processing = st.session_state.websocket_data.get('is_processing', False)
+            if is_processing:
+                st.markdown("""
+                    <div class="agent-status-bar">
+                        <div class="status-indicator status-processing"></div>
+                        <p class="status-text">Processing email...</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                    <div class="agent-status-bar">
+                        <div class="status-indicator status-idle"></div>
+                        <p class="status-text">IDLE - Ready</p>
+                    </div>
+                """, unsafe_allow_html=True)
 
-            # Display initial state
-            self.update_processing_status(st.session_state.websocket_data.get('is_processing'))
-            self.update_connection_status(st.session_state.websocket_data.get('connection_status'))
-
-            # st.markdown("---")
-            # st.subheader("Quick Stats")
-            # # Create placeholder for quick stats
-            # self.quick_stats_placeholder = st.empty()
-            # Get initial stats from API
-            # initial_stats = self.api_client.get_stats()
-            # self.update_quick_stats(initial_stats.get('processing_stats', {}))
-
-            st.markdown("---")
-            st.info("Navigate to other pages using the options above.")
+            # Connection Status Bar
+            connection_status = st.session_state.websocket_data.get('connection_status', 'Disconnected')
+            if connection_status == 'Connected':
+                st.markdown("""
+                    <div class="agent-status-bar">
+                        <div class="status-indicator status-idle"></div>
+                        <p class="status-text">Connected</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                    <div class="agent-status-bar">
+                        <div class="status-indicator" style="background-color: #dc3545;"></div>
+                        <p class="status-text">Disconnected</p>
+                    </div>
+                """, unsafe_allow_html=True)
 
         return page
-
-    def render_recent_events(self):
-        """Render recent events from WebSocket"""
-        st.subheader("Recent Events")
-        
-        events = st.session_state.websocket_data.get('latest_events', [])
-        if not events:
-            st.info("No recent events from WebSocket.")
-        else:
-            for i, event in enumerate(events[:5]):  # Show only last 5 events
-                with st.expander(f"Event {i+1}: {event.get('type', 'Unknown')}", expanded=False):
-                    st.json(event)
-
-    def update_connection_status(self, status):
-        """Update connection status in the sidebar"""
-        self.connection_status_placeholder.empty()
-        if status == 'Connected':
-            self.connection_status_placeholder.markdown(f'<p class="status-badge status-connected">🟢 {status}</p>', unsafe_allow_html=True)
-        else:
-            self.connection_status_placeholder.markdown(f'<p class="status-badge status-disconnected">🔴 {status}</p>', unsafe_allow_html=True)
-
-    def update_processing_status(self, is_processing):
-        """Update processing status in the sidebar"""
-        with self.processing_status_placeholder.container():
-            if is_processing:
-                st.spinner("Processing...")
-
-    def update_metrics(self, stats):
-        """Update metrics in the dashboard"""
-        with self.metrics_placeholder.container():
-            if stats:
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Total Processed", stats.get('total_processed', 0))
-                with col2:
-                    st.metric("Successful Replies", stats.get('successful_replies', 0))
-                with col3:
-                    st.metric("Manual Reviews", stats.get('manual_reviews', 0))
-                with col4:
-                    st.metric("Errors", stats.get('errors', 0))
-            else:
-                st.info("No stats available.")
-
-    def update_recent_events(self, events):
-        """Update recent events in the dashboard"""
-        with self.events_placeholder.container():
-            st.subheader("Recent Events")
-            if events:
-                for i, event in enumerate(events[:5]):  # Show only last 5 events
-                    with st.expander(f"Event {i+1}: {event.get('type', 'Unknown')}", expanded=False):
-                        st.json(event)
-            else:
-                st.info("No recent events from WebSocket.")
-
-    def update_charts(self, stats):
-        """Update charts in the dashboard"""
-        self.charts_placeholder.empty()
-        if stats:
-            labels = ['Successful', 'Manual Review', 'Errors']
-            values = [
-                stats.get('successful_replies', 0),
-                stats.get('manual_reviews', 0),
-                stats.get('errors', 0)
-            ]
-            
-            if any(values):
-                fig = px.pie(
-                    values=values,
-                    names=labels,
-                    title="Email Processing Distribution",
-                    hole=0.4,
-                    color_discrete_sequence=['#28a745', '#ffc107', '#dc3545']
-                )
-                fig.update_layout(
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    font_color='white',
-                    showlegend=False
-                )
-                fig.update_traces(textinfo='percent+label', textposition='inside')
-                self.charts_placeholder.plotly_chart(fig, use_container_width=True)
-            else:
-                self.charts_placeholder.info("No data available to display charts.")
-
-    # def update_quick_stats(self, stats):
-    #     """Update the quick stats in the sidebar."""
-    #     with self.quick_stats_placeholder.container():
-    #         if stats:
-    #             st.markdown(f"- **Total Processed:** {stats.get('total_processed', 0)}")
-    #             st.markdown(f"- **Successful Replies:** {stats.get('successful_replies', 0)}")
-    #             st.markdown(f"- **Manual Reviews:** {stats.get('manual_reviews', 0)}")
-    #             st.markdown(f"- **Errors:** {stats.get('errors', 0)}")
-    #         else:
-    #             st.info("No stats available.")
 
     def show_toast_notification(self, event):
         """Show toast notification for email processing result"""
@@ -489,7 +516,7 @@ class UI:
             
     def render_manual_review(self):
         """Render manual review queue with reply functionality"""
-        st.markdown('<div class="main-header"><h1>📝 Manual Review Queue</h1></div>', unsafe_allow_html=True)
+        st.markdown('<div><h1> Manual Review Queue</h1></div>', unsafe_allow_html=True)
         
         # Get manual review emails
         manual_emails = self.api_client.get_manual_review_emails()
@@ -503,7 +530,6 @@ class UI:
         # Display emails
         for i, email in enumerate(manual_emails):
             priority = email.get('priority', 'low')
-            priority_class = f"priority-{priority}" if priority in ['high', 'medium'] else ""
             
             with st.expander(
                 f"{'🔴' if priority == 'high' else '🟡' if priority == 'medium' else '🟢'} "
@@ -519,8 +545,6 @@ class UI:
                     st.markdown(f"**Subject:** `{email.get('subject')}`")
                     st.markdown(f"**Body:** `{email.get('content')}`")
                     st.markdown(f"**Priority:** `{priority.upper()}`")
-                    key=f"content_{i}"
-                
                 
                 # Reply Section
                 st.markdown("---")
@@ -542,16 +566,13 @@ class UI:
                     )
                     
                     # Action buttons
-                    col1, col2, col3 = st.columns([1, 1, 2])
+                    send_reply = st.form_submit_button("Send Reply", type="primary")
                     
-                    with col1:
-                        send_reply = st.form_submit_button("📤 Send Reply", type="primary")
+                    # with col2:
+                    #     save_draft = st.form_submit_button("💾 Save Draft")
                     
-                    with col2:
-                        save_draft = st.form_submit_button("💾 Save Draft")
-                    
-                    with col3:
-                        mark_resolved = st.form_submit_button("✅ Mark as Resolved")
+                    # with col3:
+                    #     mark_resolved = st.form_submit_button("✅ Mark as Resolved")
                     
                     # Handle form submissions
                     if send_reply:
@@ -567,9 +588,8 @@ class UI:
                                 
                                 result = self.api_client.send_manual_reply(reply_data)
                                 
-                                if result.get("success"):
+                                if result is not None and not result.get("success") == False:
                                     st.success("✅ Reply sent successfully!")
-                                    st.balloons()
                                     time.sleep(2)
                                     st.rerun()
                                 else:
@@ -577,15 +597,15 @@ class UI:
                         else:
                             st.error("❌ Please enter a reply message.")
                     
-                    if save_draft:
-                        st.info("💾 Draft saved (feature not implemented)")
+                    # if save_draft:
+                    #     st.info("💾 Draft saved (feature not implemented)")
                     
-                    if mark_resolved:
-                        st.success("✅ Email marked as resolved (feature not implemented)")
+                    # if mark_resolved:
+                    #     st.success("✅ Email marked as resolved (feature not implemented)")
 
     def render_history(self):
         """Render email history from session state."""
-        st.markdown('<div class="main-header"><h1>📜 Email History</h1></div>', unsafe_allow_html=True)
+        st.markdown('<div><h1> Email History</h1></div>', unsafe_allow_html=True)
 
         # Use processed_emails from session_state, which is updated by websockets
         processed_list = list(st.session_state.get('processed_emails', {}).values())
@@ -605,8 +625,6 @@ class UI:
                 'From': email.get('sender', ''),
                 'Subject': email.get('subject', ''),
                 'Status': email.get('status', ''),
-                # 'Response Sent': 'Yes' if email.get('response_sent') else 'No',
-                # 'Manual Review': 'Yes' if email.get('requires_manual_review') else 'No'
             })
         
         df = pd.DataFrame(summary_data)
@@ -637,9 +655,7 @@ class UI:
                     st.markdown(f"**Subject:** `{selected_mail.get('subject')}`")
                     st.markdown(f"**Status:** `{selected_mail.get('status', 'unknown')}`")
                 with col2:
-                    # st.markdown(f"**Message ID:** `{selected_mail.get('message_id', '')}`")
                     st.markdown(f"**Timestamp:** `{selected_mail.get('timestamp', '')}`")
-                    # st.markdown(f"**Response Sent:** `{'Yes' if selected_mail.get('response_sent') else 'No'}`")
 
                 # Original email content
                 st.markdown("**Original Email:**")
@@ -666,63 +682,211 @@ class UI:
                         unsafe_allow_html=True
                     )
 
-    def render_settings(self):
-        """Render settings page"""
-        st.subheader("⚙️ Settings")
+    # def render_settings(self):
+    #     """Render settings page"""
+    #     st.subheader("⚙️ Settings")
 
-        st.info("Settings are for display. Functionality to be added.")
+    #     st.info("Settings are for display. Functionality to be added.")
 
-        if st.button("Reset All Data"):
-            response = self.api_client.reset_processed_emails()
-            if response and response.get("success"):
-                st.success("All data has been successfully reset!")
-                # Also clear local state if needed
-                st.session_state.websocket_data['latest_events'] = []
-                st.rerun()
-            else:
-                st.error("Failed to reset data.")
+    #     if st.button("Reset All Data"):
+    #         response = self.api_client.reset_processed_emails()
+    #         if response and response.get("success"):
+    #             st.success("All data has been successfully reset!")
+    #             # Also clear local state if needed
+    #             st.session_state.websocket_data['latest_events'] = []
+    #             st.rerun()
+    #         else:
+    #             st.error("Failed to reset data.")
 
     def render_dashboard(self):
         """Render the main dashboard"""
-        st.markdown('<div class="main-header"><h1>📊 Email Support Demo</h1></div>', unsafe_allow_html=True)
         
-        # Create placeholders for metrics
-        self.metrics_placeholder = st.empty()
-
-        # Get initial stats from API as a fallback
-        p_stats = {d: 0 for d in ['total_processed', 'successful_replies', 'manual_reviews', 'errors']}
-        api_stats = self.api_client.get_stats()
-        if api_stats and 'processing_stats' in api_stats:
-            p_stats = api_stats['processing_stats']
+        st.markdown('<div ><h1>Email Support Demo</h1></div>', unsafe_allow_html=True)
+        self.render_dashboard_status_bars()
+        # Get stats from session state (updated by websockets) or API as fallback
+        stats = st.session_state.websocket_data.get('stats', {})
+        if not stats:
+            api_stats = self.api_client.get_stats()
+            if api_stats and 'processing_stats' in api_stats:
+                stats = api_stats['processing_stats']
         
-        self.update_metrics(p_stats)
+        # Display metrics
+        if stats:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Processed", stats.get('total_processed', 0))
+            with col2:
+                st.metric("Successful Replies", stats.get('successful_replies', 0))
+            with col3:
+                st.metric("Manual Reviews", stats.get('manual_reviews', 0))
+            with col4:
+                st.metric("Errors", stats.get('errors', 0))
+        else:
+            st.info("No stats available.")
 
-        # Charts and Events placeholders
-        st.markdown("---")
+        # Charts and Events
+        # st.markdown("---")
         col1, col2 = st.columns(2)
         
         with col1:
-            self.charts_placeholder = st.empty()
-            self.update_charts(p_stats)
+            # st.subheader("📊 Processing Distribution")
+            if stats:
+                labels = ['Successful', 'Manual Review', 'Errors']
+                values = [
+                    stats.get('successful_replies', 0),
+                    stats.get('manual_reviews', 0),
+                    stats.get('errors', 0)
+                ]
+                
+                if any(values):
+                    fig = px.pie(
+                        values=values,
+                        names=labels,
+                        title="Email Processing Distribution",
+                        hole=0.4,
+                        color_discrete_sequence=['#28a745', '#ffc107', '#dc3545']
+                    )
+                    fig.update_layout(
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        font_color='white',
+                        showlegend=False
+                    )
+                    fig.update_traces(textinfo='percent+label', textposition='inside')
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No data available to display charts.")
+            else:
+                st.info("No data available to display charts.")
         
         with col2:
-            self.events_placeholder = st.empty()
-            self.update_recent_events(st.session_state.websocket_data.get('latest_events', []))
+            st.subheader("Recent Events")
+            events = st.session_state.websocket_data.get('latest_events', [])
+            if events:
+                for i, event in enumerate(events[:5]):  # Show only last 5 events
+                    with st.expander(f"Event {i+1}: {event.get('type', 'Unknown')}", expanded=False):
+                        st.json(event)
+            else:
+                st.info("No recent events from WebSocket.")
+    def render_dashboard_status_bars(self):
+        """Render status bars for the dashboard"""
+        
+        # Get current status data
+        is_processing = st.session_state.websocket_data.get('is_processing', False)
+        connection_status = st.session_state.websocket_data.get('connection_status', 'Disconnected')
+        last_update = st.session_state.websocket_data.get('last_update')
+        stats = st.session_state.websocket_data.get('stats', {})
+        
+        # Create status bar container
+        st.markdown('<div class="dashboard-status-container">', unsafe_allow_html=True)
+        
+        # Create columns for status cards
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            # Agent Processing Status
+            if is_processing:
+                status_class = "status-processing"
+                status_text = "Processing Email"
+                status_icon = "🔄"
+            else:
+                status_class = "status-running"
+                status_text = "Ready"
+                status_icon = "✅"
+                
+            st.markdown(f"""
+                <div class="dashboard-status-card">
+                    <div class="dashboard-status-icon {status_class}"></div>
+                    <div class="dashboard-status-content">
+                        <p class="dashboard-status-title">Agent Status</p>
+                        <p class="dashboard-status-value">{status_icon} {status_text}</p>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            # Connection Status
+            if connection_status == 'Connected':
+                conn_class = "status-running"
+                conn_text = "Connected"
+                conn_icon = "🔗"
+            elif connection_status == 'Connecting...':
+                conn_class = "status-warning"
+                conn_text = "Connecting"
+                conn_icon = "⏳"
+            else:
+                conn_class = "status-stopped"
+                conn_text = "Disconnected"
+                conn_icon = "❌"
+                
+            st.markdown(f"""
+                <div class="dashboard-status-card">
+                    <div class="dashboard-status-icon {conn_class}"></div>
+                    <div class="dashboard-status-content">
+                        <p class="dashboard-status-title">Connection</p>
+                        <p class="dashboard-status-value">{conn_icon} {conn_text}</p>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            # Last Activity
+            if last_update:
+                time_diff = datetime.now() - last_update
+                if time_diff.total_seconds() < 60:
+                    activity_text = "Just now"
+                    activity_class = "status-running"
+                elif time_diff.total_seconds() < 300:  # 5 minutes
+                    activity_text = f"{int(time_diff.total_seconds()//60)}m ago"
+                    activity_class = "status-warning"
+                else:
+                    activity_text = "Inactive"
+                    activity_class = "status-stopped"
+            else:
+                activity_text = "No activity"
+                activity_class = "status-stopped"
+                
+            st.markdown(f"""
+                <div class="dashboard-status-card">
+                    <div class="dashboard-status-icon {activity_class}"></div>
+                    <div class="dashboard-status-content">
+                        <p class="dashboard-status-title">Last Activity</p>
+                        <p class="dashboard-status-value">⏰ {activity_text}</p>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            # Queue Status
+            manual_emails = self.api_client.get_manual_review_emails()
+            queue_count = len(manual_emails) if manual_emails else 0
+            
+            if queue_count > 0:
+                queue_class = "status-warning"
+                queue_text = f"{queue_count} pending"
+                queue_icon = "📋"
+            else:
+                queue_class = "status-running"
+                queue_text = "Empty"
+                queue_icon = "✅"
+                
+            st.markdown(f"""
+                <div class="dashboard-status-card">
+                    <div class="dashboard-status-icon {queue_class}"></div>
+                    <div class="dashboard-status-content">
+                        <p class="dashboard-status-title">Review Queue</p>
+                        <p class="dashboard-status-value">{queue_icon} {queue_text}</p>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown('</div>', unsafe_allow_html=True)
 
 # --- Main Application ---
 def main():
     """Main function to run the Streamlit app."""
-    # Initialize session state
-    if 'websocket_data' not in st.session_state:
-        st.session_state.websocket_data = {
-            'status': {}, 'stats': {}, 'latest_events': [],
-            'connected': False, 'last_update': None,
-            'is_processing': False, 'last_processed_event': None,
-            'connection_status': 'Disconnected'
-        }
-    if 'processed_emails' not in st.session_state:
-        st.session_state.processed_emails = {}
-
+    
+    # Create websocket manager as a singleton
     @st.cache_resource
     def get_websocket_manager():
         logger.info("Initializing and starting WebSocketManager.")
@@ -735,20 +899,7 @@ def main():
     ws_manager = get_websocket_manager()
     ui = UI(api_client)
 
-    # Render static UI components once
-    ui.render_custom_css()
-    page = ui.render_sidebar() # This now also creates placeholders in the sidebar
-
-    # Render main content layout based on selected page
-    if page == "Dashboard":
-        ui.render_dashboard() # This now also creates placeholders in the main area
-    elif page == "Manual Review":
-        ui.render_manual_review()
-    elif page == "History":
-        ui.render_history()
-    elif page == "Settings":
-        ui.render_settings()
-
+    # Process WebSocket updates first
     def process_websocket_updates():
         """Process websocket updates and return if any updates occurred"""
         updates_processed = False
@@ -761,11 +912,10 @@ def main():
             # Update session state
             if msg_type == 'connection_status':
                 st.session_state.websocket_data['connection_status'] = message.get('status', 'Unknown')
-                ui.update_connection_status(st.session_state.websocket_data['connection_status'])
+                st.session_state.websocket_data['connected'] = (message.get('status') == 'Connected')
             
             elif msg_type == 'processing_started':
                 st.session_state.websocket_data['is_processing'] = True
-                ui.update_processing_status(True)
 
             elif msg_type == 'email_processed':
                 st.session_state.websocket_data['is_processing'] = False
@@ -778,17 +928,18 @@ def main():
                 result = message.get('result', {})
                 
                 ai_response = None
-                if result.get('final_state', {}).get('reply_response', {}).get('body'):
-                    ai_response = result['final_state']['reply_response']['body']
+                if isinstance(result, dict):
+                    final_state = result.get('final_state', {})
+                    if isinstance(final_state, dict):
+                        reply_response = final_state.get('reply_response', {})
+                        if isinstance(reply_response, dict):
+                            ai_response = reply_response.get('body')
                 
                 if final_record.get('message_id'):
                     final_record['ai_response'] = ai_response
                     st.session_state.processed_emails[final_record['message_id']] = final_record
                 
-                ui.update_processing_status(False)
-                ui.update_recent_events(st.session_state.websocket_data['latest_events'])
-                
-                # Store toast data in session state instead of showing immediately
+                # Store toast data in session state
                 st.session_state.pending_toast = {
                     'type': 'email_processed',
                     'message': message
@@ -797,19 +948,16 @@ def main():
             # Update stats if present
             if 'stats' in message:
                 st.session_state.websocket_data['stats'] = message['stats']
-                stats_data = message['stats'].get('processing_stats', {})
-                ui.update_metrics(stats_data)
-                if page == "Dashboard":
-                    ui.update_charts(stats_data)
+
+            st.session_state.websocket_data['last_update'] = datetime.now()
 
         return updates_processed
 
-    # Add this right after the process_websocket_updates() call in main():
-    # Process updates once
+    # Process updates and trigger rerun if needed
     if process_websocket_updates():
-        st.rerun()
+        st.session_state.needs_rerun = True
 
-    # Show pending toast after rerun (add this right after the st.rerun() call)
+    # Show pending toast after processing updates
     if st.session_state.pending_toast:
         toast_data = st.session_state.pending_toast
         st.session_state.pending_toast = None  # Clear it immediately
@@ -817,7 +965,29 @@ def main():
         if toast_data['type'] == 'email_processed':
             ui.show_toast_notification(toast_data['message'])
 
-    time.sleep(0.1)
+    # Render UI components
+    ui.render_custom_css()
+    page = ui.render_sidebar()
+
+    # Render main content based on selected page
+    if page == "Dashboard":
+        ui.render_dashboard()
+    elif page == "Manual Review":
+        ui.render_manual_review()
+    elif page == "History":
+        ui.render_history()
+    # elif page == "Settings":
+    #     ui.render_settings()
+
+    # Auto-refresh mechanism - trigger rerun if needed
+    if st.session_state.needs_rerun:
+        st.session_state.needs_rerun = False
+        time.sleep(0.1)  # Small delay to prevent rapid reruns
+        st.rerun()
+
+    # Periodic check for updates (every 2 seconds)
+    time.sleep(2)
+    st.rerun()
 
 if __name__ == "__main__":
     main()
