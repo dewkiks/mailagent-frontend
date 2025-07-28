@@ -14,14 +14,12 @@ import logging
 from urllib.parse import urlparse, urljoin
 import socket
 import os
-from dotenv import load_dotenv
-load_dotenv()
+
 # --- Configuration ---
 
 API_BASE_URL = os.getenv("API_BASE_URL")
 # API_BASE_URL = "http://localhost:8000"
 WEBSOCKET_URL = os.getenv("WEBSOCKET_URL")
-
 
 # Configure Streamlit
 st.set_page_config(
